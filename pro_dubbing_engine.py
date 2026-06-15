@@ -45,22 +45,41 @@ class ProDubbingEngine:
         self.voice_gender = voice_gender
         self.current_key_index = 0
         
+        # Rate limiting state: {key: [timestamp1, timestamp2, ...]}
+        self.key_usage = {key: [] for key in self.api_keys}
+        self.max_rpm = 9 # Max requests per minute per key
+        
         self._initialize_voice_map()
 
-    def _get_next_client(self):
-        """Rotate through API keys and return a configured GenAI client and model config."""
+    async def _get_next_client(self):
+        """Rotate through API keys and return a configured GenAI client with rate limit awareness."""
         if not self.api_keys:
             return None, None
         
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        attempts = 0
+        while attempts < len(self.api_keys):
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            attempts += 1
+            
+            now = time.time()
+            # Clean up old timestamps (older than 60s)
+            self.key_usage[key] = [t for t in self.key_usage[key] if now - t < 60]
+            
+            if len(self.key_usage[key]) < self.max_rpm:
+                # Key is available
+                self.key_usage[key].append(now)
+                client = genai.Client(api_key=key)
+                config = types.GenerateContentConfig(
+                    max_output_tokens=65536,
+                    temperature=0.7
+                )
+                return client, config
         
-        client = genai.Client(api_key=key)
-        config = types.GenerateContentConfig(
-            max_output_tokens=65536,
-            temperature=0.7
-        )
-        return client, config
+        # All keys are at limit, wait a bit and try again
+        print("All API keys are at rate limit. Waiting 5 seconds...")
+        await asyncio.sleep(5)
+        return await self._get_next_client()
 
     def _initialize_voice_map(self):
         # Voice mapping with Male/Female options
@@ -136,7 +155,7 @@ class ProDubbingEngine:
 
     async def text_to_srt_with_ai(self, text: str) -> str:
         """Convert custom formatted text to standard SRT using Gemini AI"""
-        client, config = self._get_next_client()
+        client, config = await self._get_next_client()
         if not client:
             return self._simple_text_to_srt(text)
 
@@ -158,7 +177,7 @@ class ProDubbingEngine:
 
     async def _rewrite_text_with_ai(self, original_text: str, target_duration: float, current_tts_duration: float, lang: str) -> str:
         """Use Gemini AI to rewrite text to better fit target duration."""
-        client, config = self._get_next_client()
+        client, config = await self._get_next_client()
         if not client:
             return original_text
 
