@@ -160,8 +160,23 @@ class ProDubbingEngine:
             return self._simple_text_to_srt(text)
 
         prompt = f"""
-        Convert the following timestamped text into a valid SRT subtitle format.
-        Input: {text}
+        You are an expert subtitler. Convert the following timestamped text into a professional SRT subtitle format.
+        
+        INPUT FORMAT DESCRIPTION:
+        The input contains timestamps in brackets like [HH:MM:SS] or similar, followed by text. 
+        These timestamps usually indicate the start time of the dialogue.
+        
+        TASK:
+        1. Convert these to standard SRT format (Index, Time Range, Text).
+        2. Create precise time ranges (Start --> End). The 'End' time of a segment should generally be the 'Start' time of the next segment to ensure continuity, unless there's a natural long pause.
+        3. Add milliseconds (e.g., ,070 or ,000) to make it look professional.
+        4. Split the text into readable chunks that follow the natural flow of speech.
+        5. If the input text spans multiple lines but belongs to one sentence, split it logically across SRT indices.
+        
+        INPUT TEXT:
+        {text}
+        
+        OUTPUT ONLY THE VALID SRT CONTENT.
         """
         try:
             response = await asyncio.to_thread(
