@@ -37,15 +37,37 @@ class DubbingSegment:
         self.retries = 0
 
 class ProDubbingEngine:
-    def __init__(self, api_key: str = None, output_language: str = "my", voice_gender: str = "Male"):
+    def __init__(self, api_keys: List[str] = None, output_language: str = "my", voice_gender: str = "Male"):
         self.tolerance = 0.3  # ±0.3 seconds
-        self.api_key = api_key
+        self.api_keys = api_keys if api_keys else []
         self.output_language = output_language.lower()
         self.voice_gender = voice_gender
-        if api_key:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash-lite')
+        self.current_key_index = 0
         
+        # Initialize models for all keys
+        self.models = []
+        for key in self.api_keys:
+            try:
+                # We need a way to use different keys. genai.configure is global.
+                # To handle multiple keys, we'll configure on the fly in rotation.
+                self.models.append(key)
+            except Exception as e:
+                print(f"Error initializing key: {e}")
+        
+        self._initialize_voice_map()
+
+    def _get_next_model(self):
+        """Rotate through API keys and return a configured model."""
+        if not self.api_keys:
+            return None
+        
+        key = self.api_keys[self.current_key_index]
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        
+        genai.configure(api_key=key)
+        return genai.GenerativeModel('gemini-2.0-flash-lite')
+
+    def _initialize_voice_map(self):
         # Voice mapping with Male/Female options
         self.voice_map = {
             "my": {"Male": "my-MM-ThihaNeural", "Female": "my-MM-NilarNeural"},
@@ -119,7 +141,8 @@ class ProDubbingEngine:
 
     async def text_to_srt_with_ai(self, text: str) -> str:
         """Convert custom formatted text to standard SRT using Gemini AI"""
-        if not self.api_key:
+        model = self._get_next_model()
+        if not model:
             return self._simple_text_to_srt(text)
 
         prompt = f"""
@@ -127,14 +150,15 @@ class ProDubbingEngine:
         Input: {text}
         """
         try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            response = await asyncio.to_thread(model.generate_content, prompt)
             return response.text.strip()
         except:
             return self._simple_text_to_srt(text)
 
     async def _rewrite_text_with_ai(self, original_text: str, target_duration: float, current_tts_duration: float, lang: str) -> str:
         """Use Gemini AI to rewrite text to better fit target duration."""
-        if not self.api_key:
+        model = self._get_next_model()
+        if not model:
             return original_text
 
         duration_diff = current_tts_duration - target_duration

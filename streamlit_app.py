@@ -11,23 +11,30 @@ st.set_page_config(page_title="Pro Dubbing Engine Upgrade", page_icon="🎙️",
 st.title("🎙️ Pro Dubbing Engine - Advanced Upgrade")
 st.markdown("---")
 
-# Try to get API key from secrets first
-secret_api_key = st.secrets.get("GEMINI_API_KEY", "")
+# Try to get API keys from secrets first
+secret_api_keys = st.secrets.get("GEMINI_API_KEYS", [])
+if not secret_api_keys:
+    # Fallback to single key if exists
+    single_key = st.secrets.get("GEMINI_API_KEY", "")
+    if single_key:
+        secret_api_keys = [single_key]
 
 # Sidebar for settings
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    if secret_api_key:
-        st.success("✅ API Key loaded from Secrets")
-        api_key = secret_api_key
+    if secret_api_keys:
+        st.success(f"✅ {len(secret_api_keys)} API Keys loaded from Secrets")
+        api_keys_input = ",".join(secret_api_keys)
     else:
-        api_key = st.text_input("Gemini API Key (Optional)", type="password", help="Add GEMINI_API_KEY to Streamlit Secrets for permanent access")
+        api_keys_input = st.text_area("Gemini API Keys (Comma separated)", help="Paste multiple API keys separated by commas for rotation support.")
     
-    st.info("Upgrade: Now supports Male/Female voice selection and separate audio/SRT downloads!")
+    api_keys = [k.strip() for k in api_keys_input.split(",") if k.strip()]
+    
+    st.info("💡 Multi-API Support: Using multiple keys helps avoid rate limits during iterative rewriting.")
 
 # Initialize engine
-engine = ProDubbingEngine(api_key=api_key if api_key else None)
+engine = ProDubbingEngine(api_keys=api_keys if api_keys else [])
 
 tab1, tab2 = st.tabs(["📤 Input & Process", "📊 Analytics"])
 
