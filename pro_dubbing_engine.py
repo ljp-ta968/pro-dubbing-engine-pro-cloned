@@ -17,7 +17,7 @@ from pydub import AudioSegment
 import io
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
-from pydub.silence import detect_leading_silence, detect_trailing_silence
+# from pydub.silence import detect_leading_silence, detect_trailing_silence (Not used and causing ImportError)
 
 class DubbingSegment:
     def __init__(self, start: float, end: float, lang: str, text: str, segment_id: int):
