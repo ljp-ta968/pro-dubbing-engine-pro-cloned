@@ -44,6 +44,7 @@ class ProDubbingEngine:
         self.output_language = output_language.lower()
         self.voice_gender = voice_gender
         self.current_key_index = 0
+        self.api_lock = asyncio.Lock() # Lock for thread-safe/async-safe rotation
         
         # Rate limiting state: {key: [timestamp1, timestamp2, ...]}
         self.key_usage = {key: [] for key in self.api_keys}
@@ -56,25 +57,26 @@ class ProDubbingEngine:
         if not self.api_keys:
             return None, None
         
-        attempts = 0
-        while attempts < len(self.api_keys):
-            key = self.api_keys[self.current_key_index]
-            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-            attempts += 1
-            
-            now = time.time()
-            # Clean up old timestamps (older than 60s)
-            self.key_usage[key] = [t for t in self.key_usage[key] if now - t < 60]
-            
-            if len(self.key_usage[key]) < self.max_rpm:
-                # Key is available
-                self.key_usage[key].append(now)
-                client = genai.Client(api_key=key)
-                config = types.GenerateContentConfig(
-                    max_output_tokens=65536,
-                    temperature=0.7
-                )
-                return client, config
+        async with self.api_lock: # Ensure parallel tasks don't pick the same key simultaneously
+            attempts = 0
+            while attempts < len(self.api_keys):
+                key = self.api_keys[self.current_key_index]
+                self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+                attempts += 1
+                
+                now = time.time()
+                # Clean up old timestamps (older than 60s)
+                self.key_usage[key] = [t for t in self.key_usage[key] if now - t < 60]
+                
+                if len(self.key_usage[key]) < self.max_rpm:
+                    # Key is available
+                    self.key_usage[key].append(now)
+                    client = genai.Client(api_key=key)
+                    config = types.GenerateContentConfig(
+                        max_output_tokens=65536,
+                        temperature=0.7
+                    )
+                    return client, config
         
         # All keys are at limit, wait a bit and try again
         print("All API keys are at rate limit. Waiting 5 seconds...")
