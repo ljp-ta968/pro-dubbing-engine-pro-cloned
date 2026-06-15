@@ -15,6 +15,9 @@ import datetime
 import google.generativeai as genai
 from pydub import AudioSegment
 import io
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from pydub.silence import detect_leading_silence, detect_trailing_silence
 
 class DubbingSegment:
     def __init__(self, start: float, end: float, lang: str, text: str, segment_id: int):
@@ -29,6 +32,9 @@ class DubbingSegment:
         self.adjusted_text = text
         self.adjusted_speed = 1.0
         self.status = "pending"
+        self.original_tts_duration = None
+        self.final_audio_path = None
+        self.retries = 0
 
 class ProDubbingEngine:
     def __init__(self, api_key: str = None, output_language: str = "my", voice_gender: str = "Male"):
@@ -59,6 +65,37 @@ class ProDubbingEngine:
         elif len(parts) == 2:
             return int(parts[0]) * 60 + float(parts[1])
         return float(time_str)
+
+    def _get_audio_duration(self, audio_path: str) -> float:
+        """Get duration of an audio file using pydub."""
+        try:
+            audio = AudioSegment.from_file(audio_path)
+            return len(audio) / 1000.0  # duration in seconds
+        except Exception as e:
+            print(f"Error getting audio duration for {audio_path}: {e}")
+            return 0.0
+
+    def _adjust_audio_speed(self, audio_path: str, target_duration: float, output_path: str) -> bool:
+        """Adjust audio speed to match target duration."""
+        try:
+            audio = AudioSegment.from_file(audio_path)
+            current_duration = len(audio) / 1000.0
+            if current_duration == 0:
+                return False
+            
+            speed_factor = current_duration / target_duration
+            
+            # Apply speed adjustment
+            adjusted_audio = audio.speedup(playback_speed=speed_factor)
+            
+            # Normalize volume (optional, but good for consistency)
+            adjusted_audio = adjusted_audio.normalize()
+
+            adjusted_audio.export(output_path, format="mp3", bitrate="192k")
+            return True
+        except Exception as e:
+            print(f"Error adjusting audio speed for {audio_path}: {e}")
+            return False
 
     def parse_srt(self, srt_content: str) -> List[DubbingSegment]:
         """Parse SRT content into DubbingSegments"""
@@ -95,6 +132,39 @@ class ProDubbingEngine:
         except:
             return self._simple_text_to_srt(text)
 
+    async def _rewrite_text_with_ai(self, original_text: str, target_duration: float, current_tts_duration: float, lang: str) -> str:
+        """Use Gemini AI to rewrite text to better fit target duration."""
+        if not self.api_key:
+            return original_text
+
+        duration_diff = current_tts_duration - target_duration
+        if duration_diff > 0: # TTS is too long, need to shorten text
+            prompt = f"""
+            The following {lang} text was spoken in {current_tts_duration:.2f} seconds, but it needs to fit into {target_duration:.2f} seconds. 
+            Please rewrite the text to be shorter, while retaining its original meaning as much as possible. 
+            Do not add any introductory or concluding phrases. Just provide the rewritten text.
+            Original text: {original_text}
+            Rewritten text:
+            """
+        else: # TTS is too short, need to lengthen text
+            prompt = f"""
+            The following {lang} text was spoken in {current_tts_duration:.2f} seconds, but it needs to be {target_duration:.2f} seconds long. 
+            Please rewrite the text to be slightly longer, adding natural pauses or descriptive words, while retaining its original meaning as much as possible. 
+            Do not add any introductory or concluding phrases. Just provide the rewritten text.
+            Original text: {original_text}
+            Rewritten text:
+            """
+        try:
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            rewritten_text = response.text.strip()
+            # Basic cleanup of potential AI conversational filler
+            if rewritten_text.lower().startswith("rewritten text:"):
+                rewritten_text = rewritten_text[len("rewritten text:"):].strip()
+            return rewritten_text
+        except Exception as e:
+            print(f"AI rewrite failed: {e}")
+            return original_text
+
     def _simple_text_to_srt(self, text: str) -> str:
         lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
         srt_out = []
@@ -122,25 +192,57 @@ class ProDubbingEngine:
         k, m = divmod(len(segments), num_chunks)
         return [segments[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(num_chunks)]
 
-    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str) -> bool:
-        """Generate TTS with selected voice and gender"""
-        try:
-            # Get specific voice based on language and gender
-            lang_voices = self.voice_map.get(self.output_language, self.voice_map["my"])
-            voice = lang_voices.get(self.voice_gender, lang_voices["Male"])
-            
-            output_path = os.path.join(output_dir, f"seg_{segment.segment_id}.mp3")
-            communicate = edge_tts.Communicate(segment.text, voice)
-            await communicate.save(output_path)
-            
-            segment.tts_audio_path = output_path
-            segment.status = "tts_generated"
-            # Simple duration estimation
-            segment.tts_duration = len(segment.text.split()) / 2.5
-            return True
-        except Exception as e:
-            segment.status = f"error: {e}"
-            return False
+    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str, max_retries: int = 3) -> bool:
+        """Generate TTS with selected voice and gender, with iterative text rewriting and speed adjustment."""
+        target_duration = segment.duration
+        segment.retries = 0
+
+        while segment.retries <= max_retries:
+            try:
+                # Get specific voice based on language and gender
+                lang_voices = self.voice_map.get(self.output_language, self.voice_map["my"])
+                voice = lang_voices.get(self.voice_gender, lang_voices["Male"])
+                
+                temp_output_path = os.path.join(output_dir, f"temp_seg_{segment.segment_id}.mp3")
+                communicate = edge_tts.Communicate(segment.adjusted_text, voice)
+                await communicate.save(temp_output_path)
+                
+                tts_duration = self._get_audio_duration(temp_output_path)
+                segment.original_tts_duration = tts_duration
+
+                if abs(tts_duration - target_duration) <= self.tolerance:
+                    # Within tolerance, apply final speed adjustment
+                    final_output_path = os.path.join(output_dir, f"seg_{segment.segment_id}.mp3")
+                    if self._adjust_audio_speed(temp_output_path, target_duration, final_output_path):
+                        segment.tts_audio_path = final_output_path
+                        segment.tts_duration = self._get_audio_duration(final_output_path)
+                        segment.status = "tts_generated_adjusted"
+                        os.remove(temp_output_path) # Clean up temp file
+                        return True
+                    else:
+                        segment.status = "error: final speed adjustment failed"
+                        os.remove(temp_output_path)
+                        return False
+                else:
+                    # Not within tolerance, try rewriting text
+                    if segment.retries < max_retries:
+                        print(f"Segment {segment.segment_id}: TTS duration {tts_duration:.2f}s vs target {target_duration:.2f}s. Rewriting text...")
+                        segment.adjusted_text = await self._rewrite_text_with_ai(
+                            segment.adjusted_text, target_duration, tts_duration, segment.lang
+                        )
+                        segment.retries += 1
+                        os.remove(temp_output_path) # Clean up temp file for next attempt
+                        continue # Try generating TTS again with rewritten text
+                    else:
+                        segment.status = f"error: max retries reached, duration mismatch ({tts_duration:.2f}s vs {target_duration:.2f}s)"
+                        os.remove(temp_output_path)
+                        return False
+
+            except Exception as e:
+                segment.status = f"error: {e}"
+                if os.path.exists(temp_output_path): os.remove(temp_output_path)
+                return False
+        return False
 
     async def process_chunk(self, chunk: List[DubbingSegment], output_dir: str):
         tasks = [self.generate_tts_for_segment(seg, output_dir) for seg in chunk]
@@ -151,9 +253,14 @@ class ProDubbingEngine:
         worker_tasks = [self.process_chunk(chunk, output_dir) for chunk in chunks]
         await asyncio.gather(*worker_tasks)
         all_segments = [seg for chunk in chunks for seg in chunk]
+        # After all segments are processed, ensure final_audio_path is set for successful segments
+        for seg in all_segments:
+            if seg.status == "tts_generated_adjusted":
+                seg.final_audio_path = seg.tts_audio_path
+
         return {
             "total": len(all_segments),
-            "successful": len([s for s in all_segments if "error" not in s.status]),
+            "successful": len([s for s in all_segments if s.status == "tts_generated_adjusted"]),
             "segments": [vars(s) for s in all_segments]
         }
 
@@ -163,8 +270,8 @@ class ProDubbingEngine:
             # Sort segments by segment_id to ensure correct order
             sorted_segments = sorted(segment_list, key=lambda x: x.segment_id)
             
-            # Filter only segments with valid audio paths
-            valid_segments = [s for s in sorted_segments if s.tts_audio_path and os.path.exists(s.tts_audio_path)]
+            # Filter only segments with valid final audio paths
+            valid_segments = [s for s in sorted_segments if s.final_audio_path and os.path.exists(s.final_audio_path)]
             
             if not valid_segments:
                 return False
@@ -172,7 +279,7 @@ class ProDubbingEngine:
             # Load and concatenate audio files
             combined = AudioSegment.empty()
             for segment in valid_segments:
-                audio = AudioSegment.from_mp3(segment.tts_audio_path)
+                audio = AudioSegment.from_mp3(segment.final_audio_path)
                 combined += audio
             
             # Export to MP3
