@@ -12,7 +12,8 @@ import os
 import json
 import time
 import datetime
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from pydub import AudioSegment
 import io
 import numpy as np
@@ -44,28 +45,22 @@ class ProDubbingEngine:
         self.voice_gender = voice_gender
         self.current_key_index = 0
         
-        # Initialize models for all keys
-        self.models = []
-        for key in self.api_keys:
-            try:
-                # We need a way to use different keys. genai.configure is global.
-                # To handle multiple keys, we'll configure on the fly in rotation.
-                self.models.append(key)
-            except Exception as e:
-                print(f"Error initializing key: {e}")
-        
         self._initialize_voice_map()
 
-    def _get_next_model(self):
-        """Rotate through API keys and return a configured model."""
+    def _get_next_client(self):
+        """Rotate through API keys and return a configured GenAI client and model config."""
         if not self.api_keys:
-            return None
+            return None, None
         
         key = self.api_keys[self.current_key_index]
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         
-        genai.configure(api_key=key)
-        return genai.GenerativeModel('gemini-2.0-flash-lite')
+        client = genai.Client(api_key=key)
+        config = types.GenerateContentConfig(
+            max_output_tokens=65536,
+            temperature=0.7
+        )
+        return client, config
 
     def _initialize_voice_map(self):
         # Voice mapping with Male/Female options
@@ -141,8 +136,8 @@ class ProDubbingEngine:
 
     async def text_to_srt_with_ai(self, text: str) -> str:
         """Convert custom formatted text to standard SRT using Gemini AI"""
-        model = self._get_next_model()
-        if not model:
+        client, config = self._get_next_client()
+        if not client:
             return self._simple_text_to_srt(text)
 
         prompt = f"""
@@ -150,15 +145,21 @@ class ProDubbingEngine:
         Input: {text}
         """
         try:
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model='gemini-2.0-flash',
+                contents=prompt,
+                config=config
+            )
             return response.text.strip()
-        except:
+        except Exception as e:
+            print(f"AI SRT conversion failed: {e}")
             return self._simple_text_to_srt(text)
 
     async def _rewrite_text_with_ai(self, original_text: str, target_duration: float, current_tts_duration: float, lang: str) -> str:
         """Use Gemini AI to rewrite text to better fit target duration."""
-        model = self._get_next_model()
-        if not model:
+        client, config = self._get_next_client()
+        if not client:
             return original_text
 
         duration_diff = current_tts_duration - target_duration
@@ -179,7 +180,12 @@ class ProDubbingEngine:
             Rewritten text:
             """
         try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model='gemini-2.0-flash',
+                contents=prompt,
+                config=config
+            )
             rewritten_text = response.text.strip()
             # Basic cleanup of potential AI conversational filler
             if rewritten_text.lower().startswith("rewritten text:"):
