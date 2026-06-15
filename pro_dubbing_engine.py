@@ -192,12 +192,12 @@ class ProDubbingEngine:
         k, m = divmod(len(segments), num_chunks)
         return [segments[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(num_chunks)]
 
-    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str, max_retries: int = 3) -> bool:
+    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str) -> bool:
         """Generate TTS with selected voice and gender, with iterative text rewriting and speed adjustment."""
         target_duration = segment.duration
         segment.retries = 0
 
-        while segment.retries <= max_retries:
+        while True:
             try:
                 # Get specific voice based on language and gender
                 lang_voices = self.voice_map.get(self.output_language, self.voice_map["my"])
@@ -225,18 +225,13 @@ class ProDubbingEngine:
                         return False
                 else:
                     # Not within tolerance, try rewriting text
-                    if segment.retries < max_retries:
-                        print(f"Segment {segment.segment_id}: TTS duration {tts_duration:.2f}s vs target {target_duration:.2f}s. Rewriting text...")
-                        segment.adjusted_text = await self._rewrite_text_with_ai(
-                            segment.adjusted_text, target_duration, tts_duration, segment.lang
-                        )
-                        segment.retries += 1
-                        os.remove(temp_output_path) # Clean up temp file for next attempt
-                        continue # Try generating TTS again with rewritten text
-                    else:
-                        segment.status = f"error: max retries reached, duration mismatch ({tts_duration:.2f}s vs {target_duration:.2f}s)"
-                        os.remove(temp_output_path)
-                        return False
+                    print(f"Segment {segment.segment_id}: TTS duration {tts_duration:.2f}s vs target {target_duration:.2f}s. Rewriting text (Attempt {segment.retries + 1})...")
+                    segment.adjusted_text = await self._rewrite_text_with_ai(
+                        segment.adjusted_text, target_duration, tts_duration, segment.lang
+                    )
+                    segment.retries += 1
+                    os.remove(temp_output_path) # Clean up temp file for next attempt
+                    continue # Try generating TTS again with rewritten text
 
             except Exception as e:
                 segment.status = f"error: {e}"
