@@ -393,18 +393,21 @@ class ProDubbingEngine:
         
         # 3. Process sentence chunks in parallel
         worker_tasks = [self.process_sentence_chunk(chunk, output_dir, i+1, status_callback) for i, chunk in enumerate(sentence_chunks)]
-        await asyncio.gather(*worker_tasks)
+        # Use return_exceptions=True to ensure we catch errors but wait for all
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
         
         # After all sentences are processed, segments are already updated via _split_sentence_audio_to_segments
         # Set final_audio_path for successful segments
+        successful_count = 0
         for seg in segments:
             if seg.status == "tts_generated_adjusted":
                 seg.final_audio_path = seg.tts_audio_path
+                successful_count += 1
 
         return {
             "total": len(segments),
-            "successful": len([s for s in segments if s.status == "tts_generated_adjusted"]),
-            "segments": [vars(s) for s in segments]
+            "successful": successful_count,
+            "segments": [{"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text, "status": s.status} for s in segments]
         }
 
     def merge_audio_files(self, segment_list: List[DubbingSegment], output_path: str) -> bool:
