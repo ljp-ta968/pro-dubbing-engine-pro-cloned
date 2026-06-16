@@ -316,13 +316,22 @@ class ProDubbingEngine:
                 voice = lang_voices.get(self.voice_gender, lang_voices["Male"])
                 
                 temp_output_path = os.path.join(output_dir, f"temp_sent_{sentence.sentence_id}.mp3")
-                communicate = edge_tts.Communicate(sentence.adjusted_text, voice)
-                await communicate.save(temp_output_path)
+                try:
+                    communicate = edge_tts.Communicate(sentence.adjusted_text, voice)
+                    await communicate.save(temp_output_path)
+                except Exception as e:
+                    print(f"Edge-TTS failed: {e}")
+                    # If TTS fails, increment retry and wait
+                    sentence.retries += 1
+                    if sentence.retries >= max_ai_retries:
+                        return False
+                    await asyncio.sleep(2)
+                    continue
                 
                 tts_duration = self._get_audio_duration(temp_output_path)
                 sentence.tts_duration = tts_duration
 
-                if abs(tts_duration - target_duration) <= self.tolerance or sentence.retries >= max_ai_retries:
+                if tts_duration > 0 and (abs(tts_duration - target_duration) <= self.tolerance or sentence.retries >= max_ai_retries):
                     final_output_path = os.path.join(output_dir, f"sent_{sentence.sentence_id}.mp3")
                     if self._adjust_audio_speed(temp_output_path, target_duration, final_output_path):
                         sentence.tts_audio_path = final_output_path
@@ -339,9 +348,11 @@ class ProDubbingEngine:
                         if os.path.exists(temp_output_path): os.remove(temp_output_path)
                         return False
                 else:
-                    sentence.adjusted_text = await self._rewrite_text_with_ai(
+                    new_text = await self._rewrite_text_with_ai(
                         sentence.adjusted_text, target_duration, tts_duration, self.output_language
                     )
+                    # If AI fails to rewrite (returns same text), we still increment retry
+                    sentence.adjusted_text = new_text
                     sentence.retries += 1
                     if os.path.exists(temp_output_path): os.remove(temp_output_path)
                     continue
