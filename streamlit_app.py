@@ -154,12 +154,13 @@ with tab1:
 
                         # Use a background task to update the timer
                         async def run_with_timer():
+                            # Pass arguments exactly as defined in process_workflow_parallel(self, segments, num_workers, output_dir, status_callback)
                             process_task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
                             while not process_task.done():
                                 elapsed = time.time() - start_time
                                 timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
                                 await asyncio.sleep(1)
-                            return await process_task
+                            await process_task
 
                         asyncio.run(run_with_timer())
                         

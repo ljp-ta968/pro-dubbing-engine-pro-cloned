@@ -341,6 +341,7 @@ class ProDubbingEngine:
                     continue
             except Exception as e:
                 sentence.status = f"error: {e}"
+                if status_callback: status_callback(sentence.sentence_id, f"Error: {e}")
                 return False
 
     def _split_sentence_audio_to_segments(self, sentence: DubbingSentence, audio_path: str, output_dir: str):
