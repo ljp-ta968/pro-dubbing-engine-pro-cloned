@@ -348,7 +348,11 @@ class ProDubbingEngine:
             except Exception as e:
                 sentence.status = f"error: {e}"
                 if status_callback: status_callback(sentence.sentence_id, f"Error: {e}")
-                return False
+                sentence.retries += 1
+                if sentence.retries >= max_ai_retries:
+                    return False
+                await asyncio.sleep(2) # Wait a bit before retrying on error
+                continue
 
     def _split_sentence_audio_to_segments(self, sentence: DubbingSentence, audio_path: str, output_dir: str):
         """Split a sentence audio file back into its constituent segments based on original durations."""
