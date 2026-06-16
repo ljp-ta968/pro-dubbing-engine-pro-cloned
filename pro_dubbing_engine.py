@@ -18,7 +18,6 @@ from pydub import AudioSegment
 import io
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
-# from pydub.silence import detect_leading_silence, detect_trailing_silence (Not used and causing ImportError)
 
 class DubbingSegment:
     def __init__(self, start: float, end: float, lang: str, text: str, segment_id: int):
@@ -119,6 +118,15 @@ class ProDubbingEngine:
             return int(parts[0]) * 60 + float(parts[1])
         return float(time_str)
 
+    def _seconds_to_time(self, seconds: float) -> str:
+        """Convert seconds to HH:MM:SS,ms"""
+        td = datetime.timedelta(seconds=seconds)
+        total_seconds = int(td.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds_int = divmod(remainder, 60)
+        milliseconds = int((seconds - total_seconds) * 1000)
+        return f"{hours:02}:{minutes:02}:{seconds_int:02},{milliseconds:03}"
+
     def _get_audio_duration(self, audio_path: str) -> float:
         """Get duration of an audio file using pydub."""
         try:
@@ -138,10 +146,14 @@ class ProDubbingEngine:
             
             speed_factor = current_duration / target_duration
             
+            # Limit speed adjustment to reasonable range (0.5x to 2.0x)
+            speed_factor = max(0.5, min(2.0, speed_factor))
+            
             # Apply speed adjustment
+            # pydub's speedup is a bit crude, but works for small adjustments
             adjusted_audio = audio.speedup(playback_speed=speed_factor)
             
-            # Normalize volume (optional, but good for consistency)
+            # Normalize volume
             adjusted_audio = adjusted_audio.normalize()
 
             adjusted_audio.export(output_path, format="mp3", bitrate="192k")
@@ -220,7 +232,7 @@ class ProDubbingEngine:
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model='gemini-3-flash',
+                model='gemini-2.0-flash',
                 contents=prompt,
                 config=config
             )
@@ -255,7 +267,7 @@ class ProDubbingEngine:
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model='gemini-3-flash',
+                model='gemini-2.0-flash',
                 contents=prompt,
                 config=config
             )
@@ -288,12 +300,6 @@ class ProDubbingEngine:
             t_new = t + datetime.timedelta(seconds=seconds_to_add)
             return t_new.strftime("%H:%M:%S")
         except: return time_str
-
-    def chunk_segments_by_count(self, segments: List[DubbingSegment], num_chunks: int) -> List[List[DubbingSegment]]:
-        if not segments: return []
-        num_chunks = min(num_chunks, len(segments))
-        k, m = divmod(len(segments), num_chunks)
-        return [segments[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(num_chunks)]
 
     async def generate_tts_for_sentence(self, sentence: DubbingSentence, output_dir: str, status_callback=None) -> bool:
         """Generate TTS for a full sentence with iterative text rewriting and speed adjustment."""
@@ -356,21 +362,15 @@ class ProDubbingEngine:
                 seg_ratio = seg.duration / total_original_duration
                 seg_audio_len = len(full_audio) * seg_ratio
                 
-                seg_audio = full_audio[current_pos : current_pos + seg_audio_len]
+                seg_audio = full_audio[current_pos : current_pos + int(seg_audio_len)]
                 seg_path = os.path.join(output_dir, f"seg_{seg.segment_id}.mp3")
                 seg_audio.export(seg_path, format="mp3")
                 
                 seg.tts_audio_path = seg_path
                 seg.status = "tts_generated_adjusted"
-                current_pos += seg_audio_len
+                current_pos += int(seg_audio_len)
         except Exception as e:
             print(f"Error splitting sentence audio: {e}")
-
-            except Exception as e:
-                segment.status = f"error: {e}"
-                if os.path.exists(temp_output_path): os.remove(temp_output_path)
-                return False
-        return False
 
     async def process_sentence_chunk(self, sentences: List[DubbingSentence], output_dir: str, chunk_id: int, status_callback=None):
         """Process sentences in a chunk sequentially."""
@@ -386,7 +386,7 @@ class ProDubbingEngine:
         sentences = self.group_segments_into_sentences(segments)
         
         # 2. Chunk sentences for parallel workers
-        if not sentences: return
+        if not sentences: return {}
         num_workers = min(num_workers, len(sentences))
         k, m = divmod(len(sentences), num_workers)
         sentence_chunks = [sentences[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(num_workers)]
@@ -394,20 +394,21 @@ class ProDubbingEngine:
         # 3. Process sentence chunks in parallel
         worker_tasks = [self.process_sentence_chunk(chunk, output_dir, i+1, status_callback) for i, chunk in enumerate(sentence_chunks)]
         await asyncio.gather(*worker_tasks)
-        all_segments = [seg for chunk in chunks for seg in chunk]
-        # After all segments are processed, ensure final_audio_path is set for successful segments
-        for seg in all_segments:
+        
+        # After all sentences are processed, segments are already updated via _split_sentence_audio_to_segments
+        # Set final_audio_path for successful segments
+        for seg in segments:
             if seg.status == "tts_generated_adjusted":
                 seg.final_audio_path = seg.tts_audio_path
 
         return {
-            "total": len(all_segments),
-            "successful": len([s for s in all_segments if s.status == "tts_generated_adjusted"]),
-            "segments": [vars(s) for s in all_segments]
+            "total": len(segments),
+            "successful": len([s for s in segments if s.status == "tts_generated_adjusted"]),
+            "segments": [vars(s) for s in segments]
         }
 
     def merge_audio_files(self, segment_list: List[DubbingSegment], output_path: str) -> bool:
-        """Merge all generated audio files into a single audio file"""
+        """Merge all generated audio files into a single audio file with silence padding for timing."""
         try:
             # Sort segments by segment_id to ensure correct order
             sorted_segments = sorted(segment_list, key=lambda x: x.segment_id)
@@ -417,39 +418,42 @@ class ProDubbingEngine:
             
             if not valid_segments:
                 return False
+
+            # Create an empty audio segment
+            final_audio = AudioSegment.silent(duration=0)
             
-            # Load and concatenate audio files
-            combined = AudioSegment.empty()
-            for segment in valid_segments:
-                audio = AudioSegment.from_mp3(segment.final_audio_path)
-                combined += audio
+            current_time_ms = 0
             
-            # Export to MP3
-            combined.export(output_path, format="mp3", bitrate="192k")
+            for seg in sorted_segments:
+                target_start_ms = int(seg.start * 1000)
+                
+                # Add silence if there's a gap between segments
+                if target_start_ms > current_time_ms:
+                    silence_duration = target_start_ms - current_time_ms
+                    final_audio += AudioSegment.silent(duration=silence_duration)
+                    current_time_ms = target_start_ms
+                
+                if seg.final_audio_path and os.path.exists(seg.final_audio_path):
+                    seg_audio = AudioSegment.from_file(seg.final_audio_path)
+                    final_audio += seg_audio
+                    current_time_ms += len(seg_audio)
+                else:
+                    # If segment failed, add silence for its duration to maintain timing
+                    duration_ms = int(seg.duration * 1000)
+                    final_audio += AudioSegment.silent(duration=duration_ms)
+                    current_time_ms += duration_ms
+
+            final_audio.export(output_path, format="mp3", bitrate="192k")
             return True
         except Exception as e:
             print(f"Error merging audio files: {e}")
             return False
 
-    def generate_srt_content(self, segment_list: List[DubbingSegment]) -> str:
-        """Generate SRT content from segments"""
+    def generate_srt_content(self, segments: List[DubbingSegment]) -> str:
+        """Generate SRT file content from processed segments."""
         srt_lines = []
-        sorted_segments = sorted(segment_list, key=lambda x: x.segment_id)
-        
-        for idx, segment in enumerate(sorted_segments, 1):
-            start_time = self._seconds_to_srt_time(segment.start)
-            end_time = self._seconds_to_srt_time(segment.end)
-            srt_lines.append(f"{idx}")
-            srt_lines.append(f"{start_time} --> {end_time}")
-            srt_lines.append(segment.text)
-            srt_lines.append("")
-        
+        for i, seg in enumerate(segments):
+            start_time = self._seconds_to_time(seg.start)
+            end_time = self._seconds_to_time(seg.end)
+            srt_lines.append(f"{i+1}\n{start_time} --> {end_time}\n{seg.text}\n")
         return "\n".join(srt_lines)
-
-    def _seconds_to_srt_time(self, seconds: float) -> str:
-        """Convert seconds to SRT time format (HH:MM:SS,mmm)"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
