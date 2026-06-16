@@ -258,13 +258,17 @@ class ProDubbingEngine:
         k, m = divmod(len(segments), num_chunks)
         return [segments[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(num_chunks)]
 
-    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str) -> bool:
+    async def generate_tts_for_segment(self, segment: DubbingSegment, output_dir: str, status_callback=None) -> bool:
         """Generate TTS with selected voice and gender, with iterative text rewriting and speed adjustment."""
         target_duration = segment.duration
         segment.retries = 0
+        max_ai_retries = 50 # Safety limit to prevent infinite loops
 
         while True:
             try:
+                if status_callback:
+                    status_callback(segment.segment_id, f"Processing (Attempt {segment.retries + 1})")
+                
                 # Get specific voice based on language and gender
                 lang_voices = self.voice_map.get(self.output_language, self.voice_map["my"])
                 voice = lang_voices.get(self.voice_gender, lang_voices["Male"])
@@ -276,27 +280,37 @@ class ProDubbingEngine:
                 tts_duration = self._get_audio_duration(temp_output_path)
                 segment.original_tts_duration = tts_duration
 
-                if abs(tts_duration - target_duration) <= self.tolerance:
-                    # Within tolerance, apply final speed adjustment
+                # Check if within tolerance OR if we've reached max retries
+                if abs(tts_duration - target_duration) <= self.tolerance or segment.retries >= max_ai_retries:
+                    if segment.retries >= max_ai_retries:
+                        print(f"Segment {segment.segment_id}: Reached max retries ({max_ai_retries}). Forcing speed adjustment.")
+                        if status_callback: status_callback(segment.segment_id, "Max retries reached, forcing speed adjustment")
+                    
+                    # Apply final speed adjustment
                     final_output_path = os.path.join(output_dir, f"seg_{segment.segment_id}.mp3")
                     if self._adjust_audio_speed(temp_output_path, target_duration, final_output_path):
                         segment.tts_audio_path = final_output_path
                         segment.tts_duration = self._get_audio_duration(final_output_path)
                         segment.status = "tts_generated_adjusted"
-                        os.remove(temp_output_path) # Clean up temp file
+                        if status_callback: status_callback(segment.segment_id, "Completed")
+                        if os.path.exists(temp_output_path): os.remove(temp_output_path)
                         return True
                     else:
                         segment.status = "error: final speed adjustment failed"
-                        os.remove(temp_output_path)
+                        if status_callback: status_callback(segment.segment_id, "Error: Speed adjustment failed")
+                        if os.path.exists(temp_output_path): os.remove(temp_output_path)
                         return False
                 else:
                     # Not within tolerance, try rewriting text
-                    print(f"Segment {segment.segment_id}: TTS duration {tts_duration:.2f}s vs target {target_duration:.2f}s. Rewriting text (Attempt {segment.retries + 1})...")
+                    msg = f"Duration {tts_duration:.2f}s vs Target {target_duration:.2f}s. Rewriting..."
+                    print(f"Segment {segment.segment_id}: {msg}")
+                    if status_callback: status_callback(segment.segment_id, msg)
+                    
                     segment.adjusted_text = await self._rewrite_text_with_ai(
                         segment.adjusted_text, target_duration, tts_duration, segment.lang
                     )
                     segment.retries += 1
-                    os.remove(temp_output_path) # Clean up temp file for next attempt
+                    if os.path.exists(temp_output_path): os.remove(temp_output_path)
                     continue # Try generating TTS again with rewritten text
 
             except Exception as e:
@@ -305,13 +319,20 @@ class ProDubbingEngine:
                 return False
         return False
 
-    async def process_chunk(self, chunk: List[DubbingSegment], output_dir: str):
-        tasks = [self.generate_tts_for_segment(seg, output_dir) for seg in chunk]
-        await asyncio.gather(*tasks)
+    async def process_chunk(self, chunk: List[DubbingSegment], output_dir: str, chunk_id: int, status_callback=None):
+        """Process segments in a chunk sequentially to avoid API contention within the worker."""
+        for seg in chunk:
+            if status_callback:
+                status_callback(chunk_id, f"Worker {chunk_id}: Processing Segment {seg.segment_id}")
+            await self.generate_tts_for_segment(seg, output_dir, status_callback=lambda sid, msg: status_callback(chunk_id, f"Worker {chunk_id}: Seg {sid} - {msg}") if status_callback else None)
+        
+        if status_callback:
+            status_callback(chunk_id, f"Worker {chunk_id}: Finished all segments")
 
-    async def process_workflow_parallel(self, chunks: List[List[DubbingSegment]], output_dir: str) -> Dict:
+    async def process_workflow_parallel(self, chunks: List[List[DubbingSegment]], output_dir: str, status_callback=None) -> Dict:
         if not os.path.exists(output_dir): os.makedirs(output_dir)
-        worker_tasks = [self.process_chunk(chunk, output_dir) for chunk in chunks]
+        # Process chunks in parallel, but segments within each chunk sequentially
+        worker_tasks = [self.process_chunk(chunk, output_dir, i+1, status_callback) for i, chunk in enumerate(chunks)]
         await asyncio.gather(*worker_tasks)
         all_segments = [seg for chunk in chunks for seg in chunk]
         # After all segments are processed, ensure final_audio_path is set for successful segments

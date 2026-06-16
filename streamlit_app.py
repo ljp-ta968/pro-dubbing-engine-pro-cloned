@@ -3,6 +3,7 @@ import os
 import asyncio
 import shutil
 import json
+import time
 from pro_dubbing_engine import ProDubbingEngine
 import tempfile
 
@@ -32,6 +33,23 @@ with st.sidebar:
     api_keys = [k.strip() for k in api_keys_input.split(",") if k.strip()]
     
     st.info("💡 Multi-API Support: Using multiple keys helps avoid rate limits during iterative rewriting.")
+
+    # Sidebar Status Box
+    st.divider()
+    st.subheader("📊 Worker Status Log")
+    status_container = st.empty()
+    
+    # Initialize worker statuses in session state
+    if 'worker_statuses' not in st.session_state:
+        st.session_state.worker_statuses = {}
+
+    def update_status(worker_id, message):
+        st.session_state.worker_statuses[worker_id] = message
+        # Format the statuses for display
+        status_text = ""
+        for wid in sorted(st.session_state.worker_statuses.keys()):
+            status_text += f"**Worker {wid}**: {st.session_state.worker_statuses[wid]}\n\n"
+        status_container.markdown(status_text)
 
 # Initialize engine
 engine = ProDubbingEngine(api_keys=api_keys if api_keys else [])
@@ -114,6 +132,10 @@ with tab1:
             st.write(f"⚡ Mode: **{num_chunks} Workers** | Voice: **{selected_gender}**")
             
             if st.button("🚀 Start Parallel Professional Dubbing", use_container_width=True):
+                # Start Timer
+                start_time = time.time()
+                timer_placeholder = st.empty()
+                
                 with st.spinner("Processing..."):
                     final_srt = script_content
                     if "[00:" in script_content and "-->" not in script_content:
@@ -122,10 +144,31 @@ with tab1:
                     segments = engine.parse_srt(final_srt)
                     chunks = engine.chunk_segments_by_count(segments, num_chunks)
                     
+                    # Reset worker statuses
+                    st.session_state.worker_statuses = {i+1: "Idle" for i in range(num_chunks)}
+                    update_status(0, "") # Trigger initial display
+
                     with tempfile.TemporaryDirectory() as tmp_dir:
-                        results = asyncio.run(engine.process_workflow_parallel(chunks, tmp_dir))
+                        # Custom callback to update UI
+                        def ui_callback(worker_id, msg):
+                            update_status(worker_id, msg)
+
+                        # Use a background task to update the timer
+                        async def run_with_timer():
+                            process_task = asyncio.create_task(engine.process_workflow_parallel(chunks, tmp_dir, status_callback=ui_callback))
+                            while not process_task.done():
+                                elapsed = time.time() - start_time
+                                timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
+                                await asyncio.sleep(1)
+                            return await process_task
+
+                        results = asyncio.run(run_with_timer())
                         
                         st.session_state.results = results
+                        
+                        # Final timer update
+                        elapsed = time.time() - start_time
+                        timer_placeholder.markdown(f"### ✅ Total Process Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
                         st.session_state.final_srt = final_srt
                         st.session_state.segments = segments
 
