@@ -142,7 +142,6 @@ with tab1:
                         final_srt = asyncio.run(engine.text_to_srt_with_ai(script_content))
                     
                     segments = engine.parse_srt(final_srt)
-                    chunks = engine.chunk_segments_by_count(segments, num_chunks)
                     
                     # Reset worker statuses
                     st.session_state.worker_statuses = {i+1: "Idle" for i in range(num_chunks)}
@@ -155,15 +154,22 @@ with tab1:
 
                         # Use a background task to update the timer
                         async def run_with_timer():
-                            process_task = asyncio.create_task(engine.process_workflow_parallel(chunks, tmp_dir, status_callback=ui_callback))
+                            process_task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
                             while not process_task.done():
                                 elapsed = time.time() - start_time
                                 timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
                                 await asyncio.sleep(1)
                             return await process_task
 
-                        results = asyncio.run(run_with_timer())
+                        asyncio.run(run_with_timer())
                         
+                        # Calculate results for display
+                        successful = sum(1 for s in segments if s.status == "tts_generated_adjusted")
+                        results = {
+                            "total": len(segments),
+                            "successful": successful,
+                            "segments": [{"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text, "status": s.status} for s in segments]
+                        }
                         st.session_state.results = results
                         
                         # Final timer update
