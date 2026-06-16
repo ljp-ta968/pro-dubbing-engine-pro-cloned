@@ -137,68 +137,76 @@ with tab1:
                 timer_placeholder = st.empty()
                 
                 with st.spinner("Processing..."):
-                    final_srt = script_content
-                    if "[00:" in script_content and "-->" not in script_content:
-                        final_srt = asyncio.run(engine.text_to_srt_with_ai(script_content))
-                    
-                    segments = engine.parse_srt(final_srt)
-                    
-                    # Reset worker statuses
-                    st.session_state.worker_statuses = {i+1: "Idle" for i in range(num_chunks)}
-                    update_status(0, "") # Trigger initial display
+                    # Use a consistent event loop approach for Streamlit
+                    async def main_workflow():
+                        final_srt = script_content
+                        if "[00:" in script_content and "-->" not in script_content:
+                            final_srt = await engine.text_to_srt_with_ai(script_content)
+                        
+                        segments = engine.parse_srt(final_srt)
+                        
+                        # Reset worker statuses
+                        st.session_state.worker_statuses = {i+1: "Idle" for i in range(num_chunks)}
+                        update_status(0, "") # Trigger initial display
 
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        # Custom callback to update UI
-                        def ui_callback(worker_id, msg):
-                            update_status(worker_id, msg)
+                        with tempfile.TemporaryDirectory() as tmp_dir:
+                            # Custom callback to update UI
+                            def ui_callback(worker_id, msg):
+                                update_status(worker_id, msg)
 
-                        # Run the process and update timer periodically
-                        async def run_process():
-                            # Pass arguments exactly as defined in process_workflow_parallel(self, segments, num_workers, output_dir, status_callback)
-                            task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
+                            # Run the process and update timer periodically
+                            async def run_process():
+                                task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
+                                
+                                while not task.done():
+                                    elapsed = time.time() - start_time
+                                    timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
+                                    await asyncio.sleep(1)
+                                
+                                return await task
+
+                            await run_process()
                             
-                            while not task.done():
-                                elapsed = time.time() - start_time
-                                timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
-                                await asyncio.sleep(1)
+                            # Calculate results for display
+                            successful = sum(1 for s in segments if s.status == "tts_generated_adjusted")
+                            results = {
+                                "total": len(segments),
+                                "successful": successful,
+                                "segments": [{"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text, "status": s.status} for s in segments]
+                            }
+                            st.session_state.results = results
                             
-                            return await task
+                            # Final timer update
+                            elapsed = time.time() - start_time
+                            timer_placeholder.markdown(f"### ✅ Total Process Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
+                            st.session_state.final_srt = final_srt
+                            st.session_state.segments = segments
 
-                        # Streamlit already has a running loop in some environments, but asyncio.run is usually fine.
-                        # However, let's try a more robust way to handle the async call.
+                            # Merge audio and generate SRT content
+                            merged_audio_path = os.path.join(tmp_dir, "dubbed_audio.mp3")
+                            if engine.merge_audio_files(segments, merged_audio_path):
+                                with open(merged_audio_path, "rb") as f:
+                                    st.session_state.merged_audio_data = f.read()
+                            else:
+                                st.session_state.merged_audio_data = None
+
+                            st.session_state.generated_srt_content = engine.generate_srt_content(segments)
+                            st.success("✅ Dubbing process completed!")
+
+                    # Execute the async workflow
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
-                        try:
-                            loop.run_until_complete(run_process())
-                        finally:
-                            loop.close()
-                        
-                        # Calculate results for display
-                        successful = sum(1 for s in segments if s.status == "tts_generated_adjusted")
-                        results = {
-                            "total": len(segments),
-                            "successful": successful,
-                            "segments": [{"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text, "status": s.status} for s in segments]
-                        }
-                        st.session_state.results = results
-                        
-                        # Final timer update
-                        elapsed = time.time() - start_time
-                        timer_placeholder.markdown(f"### ✅ Total Process Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
-                        st.session_state.final_srt = final_srt
-                        st.session_state.segments = segments
-
-                        # Merge audio and generate SRT content within the temp directory scope
-                        merged_audio_path = os.path.join(tmp_dir, "dubbed_audio.mp3")
-                        if engine.merge_audio_files(segments, merged_audio_path):
-                            with open(merged_audio_path, "rb") as f:
-                                st.session_state.merged_audio_data = f.read()
-                        else:
-                            st.session_state.merged_audio_data = None
-
-                        st.session_state.generated_srt_content = engine.generate_srt_content(segments)
-
-                        st.success("✅ Dubbing process completed!")
+                    
+                    if loop.is_running():
+                        # In some Streamlit environments, a loop might already be running
+                        import nest_asyncio
+                        nest_asyncio.apply()
+                        loop.run_until_complete(main_workflow())
+                    else:
+                        loop.run_until_complete(main_workflow())
         else:
             st.warning("⚠️ Please provide input to enable dubbing.")
 
@@ -260,5 +268,6 @@ with tab2:
         res = st.session_state.results
         st.write("**Segment Timeline**")
         for s in res['segments']:
-            status_color = "🟢" if s['status'] == 'tts_generated' else "🟡" if 'adjusted' in s['status'] else "🔴"
+            # Fixed status color mapping: tts_generated_adjusted is the successful state in this engine
+            status_color = "🟢" if s['status'] in ['tts_generated', 'tts_generated_adjusted'] else "🟡" if 'pending' in s['status'] else "🔴"
             st.text(f"{status_color} [{s['start']:.2f}s - {s['end']:.2f}s] | {s['text'][:50]}...")

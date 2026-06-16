@@ -71,31 +71,31 @@ class ProDubbingEngine:
         if not self.api_keys:
             return None, None
         
-        async with self.api_lock: # Ensure parallel tasks don't pick the same key simultaneously
-            attempts = 0
-            while attempts < len(self.api_keys):
-                key = self.api_keys[self.current_key_index]
-                self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-                attempts += 1
-                
-                now = time.time()
-                # Clean up old timestamps (older than 60s)
-                self.key_usage[key] = [t for t in self.key_usage[key] if now - t < 60]
-                
-                if len(self.key_usage[key]) < self.max_rpm:
-                    # Key is available
-                    self.key_usage[key].append(now)
-                    client = genai.Client(api_key=key)
-                    config = types.GenerateContentConfig(
-                        max_output_tokens=65536,
-                        temperature=0.7
-                    )
-                    return client, config
-        
-        # All keys are at limit, wait a bit and try again
-        print("All API keys are at rate limit. Waiting 5 seconds...")
-        await asyncio.sleep(5)
-        return await self._get_next_client()
+        while True:
+            async with self.api_lock: # Ensure parallel tasks don't pick the same key simultaneously
+                attempts = 0
+                while attempts < len(self.api_keys):
+                    key = self.api_keys[self.current_key_index]
+                    self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+                    attempts += 1
+                    
+                    now = time.time()
+                    # Clean up old timestamps (older than 60s)
+                    self.key_usage[key] = [t for t in self.key_usage[key] if now - t < 60]
+                    
+                    if len(self.key_usage[key]) < self.max_rpm:
+                        # Key is available
+                        self.key_usage[key].append(now)
+                        client = genai.Client(api_key=key)
+                        config = types.GenerateContentConfig(
+                            max_output_tokens=65536,
+                            temperature=0.7
+                        )
+                        return client, config
+            
+            # All keys are at limit, wait a bit and loop
+            print("All API keys are at rate limit. Waiting 5 seconds...")
+            await asyncio.sleep(5)
 
     def _initialize_voice_map(self):
         # Voice mapping with Male/Female options
@@ -455,5 +455,7 @@ class ProDubbingEngine:
         for i, seg in enumerate(segments):
             start_time = self._seconds_to_time(seg.start)
             end_time = self._seconds_to_time(seg.end)
-            srt_lines.append(f"{i+1}\n{start_time} --> {end_time}\n{seg.text}\n")
+            # Use adjusted_text if available, otherwise fallback to original text
+            display_text = getattr(seg, 'adjusted_text', seg.text)
+            srt_lines.append(f"{i+1}\n{start_time} --> {end_time}\n{display_text}\n")
         return "\n".join(srt_lines)
