@@ -152,17 +152,26 @@ with tab1:
                         def ui_callback(worker_id, msg):
                             update_status(worker_id, msg)
 
-                        # Use a background task to update the timer
-                        async def run_with_timer():
+                        # Run the process and update timer periodically
+                        async def run_process():
                             # Pass arguments exactly as defined in process_workflow_parallel(self, segments, num_workers, output_dir, status_callback)
-                            process_task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
-                            while not process_task.done():
+                            task = asyncio.create_task(engine.process_workflow_parallel(segments, num_chunks, tmp_dir, status_callback=ui_callback))
+                            
+                            while not task.done():
                                 elapsed = time.time() - start_time
                                 timer_placeholder.markdown(f"### ⏱️ Running Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
                                 await asyncio.sleep(1)
-                            await process_task
+                            
+                            return await task
 
-                        asyncio.run(run_with_timer())
+                        # Streamlit already has a running loop in some environments, but asyncio.run is usually fine.
+                        # However, let's try a more robust way to handle the async call.
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            loop.run_until_complete(run_process())
+                        finally:
+                            loop.close()
                         
                         # Calculate results for display
                         successful = sum(1 for s in segments if s.status == "tts_generated_adjusted")
