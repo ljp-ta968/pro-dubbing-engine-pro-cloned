@@ -305,7 +305,7 @@ class ProDubbingEngine:
         """Generate TTS for a full sentence with iterative text rewriting and speed adjustment."""
         target_duration = sentence.duration
         sentence.retries = 0
-        max_ai_retries = 50 
+        max_ai_retries = 5 
 
         while True:
             try:
